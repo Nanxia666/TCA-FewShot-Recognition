@@ -49,7 +49,7 @@ and two frozen SAM backbones:
 ## Framework
 
 <p align="center">
-  <img src="assets/tca_framework.png" width="95%" alt="TCA framework">
+  <img src="asset/tca_framework.png" width="95%" alt="TCA framework">
 </p>
 
 The complete framework consists of:
