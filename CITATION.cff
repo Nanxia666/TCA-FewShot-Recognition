@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the TCA paper."
+title: "TCA: Template-Conditioned Aggregation for Accurate Few-Shot Object Recognition"
+type: software
+authors:
+  - family-names: Zhan
+    given-names: Lingtao
+  - family-names: Zhang
+    given-names: Teng
+  - family-names: Wang
+    given-names: Yeliang
+year: 2026
+repository-code: "https://github.com/Nanxia666/TCA-FewShot-Recognition"
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: "TCA: Template-Conditioned Aggregation for Accurate Few-Shot Object Recognition"
+  authors:
+    - family-names: Zhan
+      given-names: Lingtao
+    - family-names: Zhang
+      given-names: Teng
+    - family-names: Wang
+      given-names: Yeliang
+  collection-title: "Asian Conference on Computer Vision (ACCV)"
+  year: 2026

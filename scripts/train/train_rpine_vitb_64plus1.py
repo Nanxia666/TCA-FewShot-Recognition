@@ -1,0 +1,1685 @@
+import os
+CUDA_VISIBLE_DEVICES = r"0"  # change to "0" or "1" before training
+os.environ['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import math
+import json
+import time
+import random
+import contextlib
+from pathlib import Path
+from collections import defaultdict
+import numpy as np
+from PIL import Image, ImageDraw
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision.ops import roi_align
+from segment_anything import sam_model_registry
+from torchmetrics.detection import MeanAveragePrecision
+
+# =========================================================
+# 配置区：直接改这里
+# =========================================================
+train_image_dir = r"RPINE/train/images"
+train_exemplar_json_path = r"RPINE/train/exemplars.json"
+train_label_dir = r"RPINE/train/labels"
+
+val_image_dir = r"RPINE/test/images"
+val_exemplar_json_path = r"RPINE/test/exemplars.json"
+val_label_dir = r"RPINE/test/labels"
+
+sam_checkpoint = r"sam_vit_b_01ec64.pth"
+sam_model_type = "vit_b"
+save_dir = r"model/rpine_vitb"
+
+# =========================================================
+# Ablation / cache setting
+# =========================================================
+ablation_name = "compact_64plus1_no_attention"
+
+# 使用已经预提取好的 SAM ViT-B 特征，不在训练中重复运行 SAM encoder。
+# 目录结构：
+#   cache_sam_vitb_1024/RPINE/train/*.pt
+#   cache_sam_vitb_1024/RPINE/test/*.pt
+sam_feature_cache_root = r"cache_sam_vitb_1024/RPINE"
+cached_feature_to_float32 = False
+strict_feature_cache = True
+
+# =========================================================
+# Regularization + fast cache-only AMP settings
+# =========================================================
+use_amp = True
+amp_dtype = "float16"
+allow_tf32 = True
+skip_cached_image_resize = True
+
+# cache-mode regularization
+template_jitter_center = 0.05
+template_jitter_scale = 0.10
+feature_dropout_p = 0.05
+branch_dropout_p = 0.10
+# =========================================================
+
+# 自动断点续训：如果 save_dir/last_model.pth 存在，就从下一轮 epoch 继续
+auto_resume = True
+# 留空表示默认读取 os.path.join(save_dir, "last_model.pth")
+resume_checkpoint_path = r""
+
+sam_img_size = 1024
+pred_size = 256
+project_dim = 128
+decoder_mid_dim = 96
+decoder_out_dim = 64
+template_roi_size = 5
+num_context_branches = 6
+
+epochs = 100
+batch_size = 4
+# 评估 batch，建议 4 或 8；避免 batch=1 连续小 kernel 调用太多
+eval_batch_size = 16
+num_workers = 2
+lr = 2e-4
+weight_decay = 3e-4
+grad_clip_norm = 5.0
+
+lambda_center = 1.0
+lambda_giou = 2.0
+lambda_size = 1.0
+lambda_attn = 0.0
+lambda_offset_cls = 0.5
+
+gaussian_min_radius = 1
+gaussian_radius_ratio = 0.15
+attention_radius_ratio = 0.30
+
+# AP 评估时为了得到完整 PR 曲线，decode 阈值应低一些
+ap_score_thresh = 0.03
+# AP 评估每图最多预测数，避免评估阶段候选过多
+ap_max_dets_per_image = 4500
+
+# eval 内部追踪设置
+eval_trace_every = 10
+eval_empty_cache_every = 20
+
+score_thresh = 0.25
+topk_per_image = 4500
+max_dets_per_image = 4500
+nms_iou_thresh = 0.4
+
+eval_interval = 1
+vis_interval = 100000000
+num_vis_images = 20
+seed = 42
+debug_anomaly = False
+image_exts = [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"]
+
+
+def pil_read_rgb(image_path):
+    """
+    PIL 读取 RGB，避免 cv2 在 Windows 下偶发 native crash。
+    """
+    img = Image.open(image_path).convert("RGB")
+    return np.asarray(img, dtype=np.uint8)
+
+
+
+def pil_image_size(image_path):
+    """
+    cache-only 训练只需要原图尺寸做坐标映射，不再读取整张图和 resize。
+    """
+    with Image.open(image_path) as img:
+        w, h = img.size
+    return int(w), int(h)
+
+
+def make_sam_meta_from_hw(h, w, target_size=1024):
+    """
+    SAM ResizeLongestSide 的坐标 meta。
+    不生成 padded image，只保留坐标换算所需字段。
+    """
+    scale = target_size / float(max(h, w))
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+    return {
+        "orig_h": int(h),
+        "orig_w": int(w),
+        "scale": float(scale),
+        "resized_h": int(new_h),
+        "resized_w": int(new_w),
+        "target_size": int(target_size),
+    }
+
+
+def get_amp_dtype():
+    if str(amp_dtype).lower() in ["bf16", "bfloat16"]:
+        return torch.bfloat16
+    return torch.float16
+
+
+def amp_autocast(device):
+    if not (bool(use_amp) and device.type == "cuda"):
+        return contextlib.nullcontext()
+    return torch.autocast(device_type="cuda", dtype=get_amp_dtype(), enabled=True)
+
+
+def make_grad_scaler(device):
+    enabled = bool(use_amp) and device.type == "cuda" and get_amp_dtype() == torch.float16
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def jitter_template_box(box, sam_size=1024, center_jitter=0.05, scale_jitter=0.10):
+    """
+    Training-only template jitter in SAM padded coordinate space.
+    GT boxes remain unchanged; only the support/template ROI is slightly shifted/scaled.
+    """
+    x1, y1, x2, y2 = [float(v) for v in box]
+    w = max(2.0, x2 - x1)
+    h = max(2.0, y2 - y1)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    dx = random.uniform(-center_jitter, center_jitter) * w
+    dy = random.uniform(-center_jitter, center_jitter) * h
+    sw = math.exp(random.uniform(-scale_jitter, scale_jitter))
+    sh = math.exp(random.uniform(-scale_jitter, scale_jitter))
+
+    nw = max(2.0, w * sw)
+    nh = max(2.0, h * sh)
+    ncx = cx + dx
+    ncy = cy + dy
+
+    nx1 = max(0.0, min(float(sam_size - 1), ncx - 0.5 * nw))
+    ny1 = max(0.0, min(float(sam_size - 1), ncy - 0.5 * nh))
+    nx2 = max(nx1 + 1.0, min(float(sam_size - 1), ncx + 0.5 * nw))
+    ny2 = max(ny1 + 1.0, min(float(sam_size - 1), ncy + 0.5 * nh))
+
+    return [nx1, ny1, nx2, ny2]
+
+def pil_resize_rgb(image_rgb, new_w, new_h):
+    """
+    PIL resize，输入/输出都是 numpy RGB uint8。
+    """
+    img = Image.fromarray(image_rgb)
+    img = img.resize((int(new_w), int(new_h)), Image.BILINEAR)
+    return np.asarray(img, dtype=np.uint8)
+
+
+
+def set_seed(seed_value=42):
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
+
+
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def find_image_file(image_dir, file_or_stem):
+    image_dir = Path(image_dir)
+    p = image_dir / file_or_stem
+    if p.is_file():
+        return str(p), p.name
+    stem = Path(file_or_stem).stem
+    for ext in image_exts:
+        for e in (ext, ext.upper()):
+            p = image_dir / f"{stem}{e}"
+            if p.is_file():
+                return str(p), p.name
+    return None, None
+
+
+def clamp_box_xyxy(box, w, h):
+    x1, y1, x2, y2 = box
+    x1 = max(0.0, min(float(x1), float(w - 1)))
+    y1 = max(0.0, min(float(y1), float(h - 1)))
+    x2 = max(0.0, min(float(x2), float(w - 1)))
+    y2 = max(0.0, min(float(y2), float(h - 1)))
+    if x2 <= x1:
+        x2 = min(float(w - 1), x1 + 1.0)
+    if y2 <= y1:
+        y2 = min(float(h - 1), y1 + 1.0)
+    return [x1, y1, x2, y2]
+
+
+def box_area_xyxy(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def resize_longest_side_and_pad_rgb(image_rgb, target_size=1024):
+    h, w = image_rgb.shape[:2]
+    scale = target_size / float(max(h, w))
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+    resized = pil_resize_rgb(image_rgb, new_w, new_h)
+    padded = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    padded[:new_h, :new_w] = resized
+    meta = {"orig_h": h, "orig_w": w, "scale": scale, "resized_h": new_h, "resized_w": new_w, "target_size": target_size}
+    return padded, meta
+
+
+def boxes_original_to_sam_padded(boxes, meta, target_size=1024):
+    out = []
+    scale = meta["scale"]
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        nb = clamp_box_xyxy([x1 * scale, y1 * scale, x2 * scale, y2 * scale], target_size, target_size)
+        if box_area_xyxy(nb) >= 4:
+            out.append(nb)
+    return out
+
+
+def boxes_sam_padded_to_original(boxes, meta):
+    out = []
+    scale = meta["scale"]
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        out.append(clamp_box_xyxy([x1 / scale, y1 / scale, x2 / scale, y2 / scale], meta["orig_w"], meta["orig_h"]))
+    return out
+
+
+def read_txt_boxes_xyxy(txt_path, image_w, image_h):
+    boxes = []
+    if not os.path.isfile(txt_path):
+        return boxes
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            parts = raw.replace(",", " ").split()
+            if len(parts) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in parts]
+            except Exception:
+                continue
+            box = clamp_box_xyxy([x1, y1, x2, y2], image_w, image_h)
+            if box_area_xyxy(box) >= 4:
+                boxes.append(box)
+    return boxes
+
+
+def load_exemplar_records(exemplar_json_path, image_dir):
+    with open(exemplar_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    records = {}
+
+    if isinstance(data, dict) and "images" in data and "annotations" in data:
+        anns_by_image = defaultdict(list)
+        for ann in data.get("annotations", []):
+            anns_by_image[int(ann["image_id"])].append(ann)
+        for img in data.get("images", []):
+            file_name = img["file_name"]
+            image_path, real_name = find_image_file(image_dir, file_name)
+            if image_path is None:
+                continue
+            boxes = []
+            for ann in anns_by_image.get(int(img["id"]), []):
+                bbox = ann.get("bbox")
+                if bbox is None or len(bbox) != 4:
+                    continue
+                x, y, bw, bh = [float(v) for v in bbox]
+                boxes.append([x, y, x + bw, y + bh])
+            if boxes:
+                records[Path(real_name).stem] = {"file_name": real_name, "image_path": image_path, "template_boxes": boxes}
+        return records
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            file_name = key
+            boxes_raw = None
+            if isinstance(value, dict):
+                file_name = value.get("file_name", key)
+                boxes_raw = value.get("boxes", value.get("bboxes", None))
+            elif isinstance(value, list):
+                boxes_raw = value
+            if not boxes_raw:
+                continue
+            image_path, real_name = find_image_file(image_dir, file_name)
+            if image_path is None:
+                image_path, real_name = find_image_file(image_dir, key)
+            if image_path is None:
+                continue
+            boxes = []
+            for b in boxes_raw:
+                if isinstance(b, dict):
+                    b = b.get("bbox")
+                if b is None or len(b) != 4:
+                    continue
+                boxes.append([float(v) for v in b])
+            if boxes:
+                records[Path(real_name).stem] = {"file_name": real_name, "image_path": image_path, "template_boxes": boxes}
+    return records
+
+
+class TemplateDataset(Dataset):
+    def __init__(self, image_dir, exemplar_json_path, label_dir, training=True, split_name=None):
+        self.training = training
+        self.image_dir = image_dir
+        self.label_dir = label_dir
+
+        if split_name is None:
+            # 根据路径自动判断 cache 子目录。这里默认只使用 train/test。
+            lower_dir = str(Path(image_dir).as_posix()).lower()
+            if "/train/" in lower_dir or lower_dir.endswith("/train/images"):
+                split_name = "train"
+            elif "/test/" in lower_dir or lower_dir.endswith("/test/images"):
+                split_name = "test"
+            elif "/test/" in lower_dir or lower_dir.endswith("/test/images"):
+                split_name = "test"
+            else:
+                split_name = "train" if training else "test"
+        self.split_name = split_name
+
+        self.cache_root = sam_feature_cache_root
+        self.cache_dirs = [
+            os.path.join(self.cache_root, self.split_name),
+            os.path.join(self.cache_root, "train" if self.training else "test"),
+            os.path.join(self.cache_root, "images"),
+            self.cache_root,
+        ]
+
+        self.records_raw = load_exemplar_records(exemplar_json_path, image_dir)
+        self.keys = []
+        self.records = {}
+        miss = empty_gt = empty_tpl = missing_cache = 0
+
+        for stem, rec in self.records_raw.items():
+            txt_path = os.path.join(label_dir, stem + ".txt")
+            if not os.path.isfile(txt_path):
+                miss += 1
+                continue
+
+            cache_path = self.find_cache_file(stem, rec.get("file_name", None))
+            if cache_path is None:
+                missing_cache += 1
+                if strict_feature_cache:
+                    continue
+
+            try:
+                w, h = pil_image_size(rec["image_path"])
+            except Exception:
+                continue
+
+            gt = read_txt_boxes_xyxy(txt_path, w, h)
+            tpl = [clamp_box_xyxy(b, w, h) for b in rec["template_boxes"]]
+            tpl = [b for b in tpl if box_area_xyxy(b) >= 4]
+
+            if not gt:
+                empty_gt += 1
+                continue
+            if not tpl:
+                empty_tpl += 1
+                continue
+
+            self.keys.append(stem)
+            self.records[stem] = {
+                "file_name": rec["file_name"],
+                "image_path": rec["image_path"],
+                "txt_path": txt_path,
+                "template_boxes": tpl,
+                "cache_path": cache_path,
+            }
+
+        print(f"[Dataset] {image_dir}")
+        print(f"  split_name: {self.split_name}")
+        print(f"  exemplar json: {exemplar_json_path}")
+        print(f"  label dir: {label_dir}")
+        print(f"  cache root: {self.cache_root}")
+        print(f"  cache dirs:")
+        for d in self.cache_dirs:
+            print(f"    - {d}")
+        print(f"  valid images: {len(self.keys)}")
+        print(f"  missing label txt: {miss}")
+        print(f"  empty label txt: {empty_gt}")
+        print(f"  empty template boxes: {empty_tpl}")
+        print(f"  missing feature cache: {missing_cache}")
+
+    def find_cache_file(self, stem, file_name=None):
+        stems = []
+        for n in [stem, file_name]:
+            if n:
+                stems.append(Path(n).stem)
+        stems = list(dict.fromkeys(stems))
+
+        for d in self.cache_dirs:
+            if not os.path.isdir(d):
+                continue
+            for st in stems:
+                p = os.path.join(d, f"{st}.pt")
+                if os.path.isfile(p):
+                    return p
+            for st in stems:
+                hits = list(Path(d).glob(f"{st}_*.pt"))
+                if len(hits) > 0:
+                    return str(hits[0])
+        return None
+
+    def load_cached_feature(self, cache_path):
+        cache_obj = torch.load(cache_path, map_location="cpu")
+        if isinstance(cache_obj, dict):
+            for key in ["feat", "sam_feat", "features", "image_embedding", "image_embeddings"]:
+                if key in cache_obj:
+                    feat = cache_obj[key]
+                    break
+            else:
+                # 兜底：找第一个 Tensor
+                tensors = [v for v in cache_obj.values() if torch.is_tensor(v)]
+                if len(tensors) == 0:
+                    raise KeyError(f"No tensor feature found in cache file: {cache_path}")
+                feat = tensors[0]
+        else:
+            feat = cache_obj
+
+        if not torch.is_tensor(feat):
+            feat = torch.as_tensor(feat)
+
+        # 兼容 [1,256,64,64] 和 [256,64,64]
+        if feat.dim() == 4 and feat.shape[0] == 1:
+            feat = feat[0]
+        if feat.dim() != 3:
+            raise ValueError(f"Expected SAM feature shape [256,64,64], got {tuple(feat.shape)} from {cache_path}")
+
+        if cached_feature_to_float32:
+            feat = feat.float()
+        return feat.contiguous()
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        stem = self.keys[idx]
+        rec = self.records[stem]
+        try:
+            w, h = pil_image_size(rec["image_path"])
+        except Exception as e:
+            raise FileNotFoundError(rec["image_path"]) from e
+
+        gt_orig = read_txt_boxes_xyxy(rec["txt_path"], w, h)
+        tpl_orig = [clamp_box_xyxy(b, w, h) for b in rec["template_boxes"]]
+        tpl_orig = [b for b in tpl_orig if box_area_xyxy(b) >= 4]
+
+        meta = make_sam_meta_from_hw(h, w, target_size=sam_img_size)
+        padded = None
+        gt_sam = boxes_original_to_sam_padded(gt_orig, meta, target_size=sam_img_size)
+        tpl_sam = boxes_original_to_sam_padded(tpl_orig, meta, target_size=sam_img_size)
+
+        if not gt_sam:
+            gt_sam = [[0, 0, 10, 10]]
+        if not tpl_sam:
+            tpl_sam = gt_sam
+
+        template_box = random.choice(tpl_sam) if self.training else tpl_sam[0]
+        if self.training:
+            template_box = jitter_template_box(
+                template_box,
+                sam_size=sam_img_size,
+                center_jitter=template_jitter_center,
+                scale_jitter=template_jitter_scale,
+            )
+        sam_feat = self.load_cached_feature(rec["cache_path"])
+
+        return {
+            "image": padded,
+            "image_id": stem,
+            "file_name": rec["file_name"],
+            "template_box": template_box,
+            "template_candidates": tpl_sam,
+            "gt_boxes": gt_sam,
+            "meta": meta,
+            "sam_feat": sam_feat,
+        }
+
+
+def collate_fn(batch):
+    return batch
+
+
+class ConvGNAct(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
+        g = min(8, out_ch)
+        while out_ch % g != 0 and g > 1:
+            g -= 1
+        self.norm = nn.GroupNorm(g, out_ch)
+        self.act = nn.GELU()
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+def crop_feature_roi_to_fixed(feat, boxes_sam, out_size=7, sam_size=1024):
+    """
+    真正 RoIAlign 版模板 ROI 采样。
+    模板框整体 -> 7×7 token，用于生成空间分支权重和通道门控。
+    """
+    B, C, H, W = feat.shape
+    device = feat.device
+    dtype = feat.dtype
+
+    rois = []
+    for i, box in enumerate(boxes_sam):
+        x1, y1, x2, y2 = box
+        x1 = max(0.0, min(float(x1), sam_size - 1.0))
+        y1 = max(0.0, min(float(y1), sam_size - 1.0))
+        x2 = max(x1 + 1.0, min(float(x2), sam_size - 1.0))
+        y2 = max(y1 + 1.0, min(float(y2), sam_size - 1.0))
+        rois.append([i, x1, y1, x2, y2])
+
+    rois = torch.tensor(rois, device=device, dtype=dtype)
+    spatial_scale = W / float(sam_size)
+
+    roi_feat = roi_align(
+        input=feat,
+        boxes=rois,
+        output_size=(out_size, out_size),
+        spatial_scale=spatial_scale,
+        sampling_ratio=2,
+        aligned=True,
+    )
+
+    return roi_feat
+
+
+class TemplateDynamicContextAggregation(nn.Module):
+    """
+    模板条件动态上下文聚合：6 组多尺度/多形状分支 + 通道自适应门控。
+
+    分支顺序：
+        0 identity
+        1 3×3
+        2 5×5
+        3 7×7
+        4 cross5 = 0.5 × (1×5 + 5×1)
+        5 cross7 = 0.5 × (1×7 + 7×1)
+    """
+    def __init__(self, in_ch=256, out_ch=128, roi_size=7, num_branches=6):
+        super().__init__()
+        self.out_ch = out_ch
+        self.roi_size = roi_size
+        self.num_branches = num_branches
+        self.feat_drop = nn.Dropout2d(p=float(feature_dropout_p))
+
+        self.proj = ConvGNAct(in_ch, out_ch, k=1, s=1, p=0)
+        self.branch_identity = nn.Identity()
+
+        self.branch_dw3 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.branch_dw5 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=5, padding=2, groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.branch_dw7 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=7, padding=3, groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+
+        self.branch_h1x5 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(1, 5), padding=(0, 2), groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.branch_v5x1 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(5, 1), padding=(2, 0), groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.branch_h1x7 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(1, 7), padding=(0, 3), groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.branch_v7x1 = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(7, 1), padding=(3, 0), groups=out_ch, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+
+        self.visual_mlp = nn.Sequential(
+            nn.Linear(out_ch * 2, out_ch),
+            nn.GELU(),
+            nn.Linear(out_ch, num_branches),
+        )
+        self.size_mlp = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, num_branches),
+        )
+        self.size_embed_for_channel = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 32),
+        )
+        self.channel_gate_mlp = nn.Sequential(
+            nn.Linear(out_ch * 2 + 32, out_ch),
+            nn.GELU(),
+            nn.Linear(out_ch, out_ch),
+        )
+        self.channel_mix = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+        )
+        self.refine = ConvGNAct(out_ch, out_ch, k=1, s=1, p=0)
+
+        nn.init.zeros_(self.visual_mlp[-1].weight)
+        nn.init.zeros_(self.visual_mlp[-1].bias)
+        nn.init.zeros_(self.size_mlp[-1].weight)
+        nn.init.zeros_(self.size_mlp[-1].bias)
+        nn.init.zeros_(self.channel_gate_mlp[-1].weight)
+        nn.init.zeros_(self.channel_gate_mlp[-1].bias)
+
+    def build_size_feat(self, boxes, device, dtype):
+        vals = []
+        for x1, y1, x2, y2 in boxes:
+            w = max(1.0, x2 - x1)
+            h = max(1.0, y2 - y1)
+            vals.append([
+                math.log(w / sam_img_size + 1e-6),
+                math.log(h / sam_img_size + 1e-6),
+                math.log((w * h) / (sam_img_size * sam_img_size) + 1e-6),
+                math.log(w / h + 1e-6),
+            ])
+        return torch.tensor(vals, device=device, dtype=dtype)
+
+    def forward(self, sam_feat, template_boxes_sam):
+        feat = self.proj(sam_feat)
+        if self.training and feature_dropout_p > 0:
+            feat = self.feat_drop(feat)
+        roi = crop_feature_roi_to_fixed(feat, template_boxes_sam, out_size=self.roi_size, sam_size=sam_img_size)
+
+        c = self.roi_size // 2
+        center_feat = roi[:, :, c-1:c+2, c-1:c+2].mean(dim=(-2, -1))
+        context_feat = roi.mean(dim=(-2, -1))
+        size_feat = self.build_size_feat(template_boxes_sam, feat.device, feat.dtype)
+
+        visual_logits = self.visual_mlp(torch.cat([center_feat, context_feat], dim=1))
+        size_logits = self.size_mlp(size_feat)
+        branch_weights = F.softmax(visual_logits + size_logits, dim=1)
+        if self.training and branch_dropout_p > 0:
+            keep = (torch.rand_like(branch_weights) > float(branch_dropout_p)).to(branch_weights.dtype)
+            empty = keep.sum(dim=1, keepdim=True) < 1
+            keep = torch.where(empty, torch.ones_like(keep), keep)
+            branch_weights = branch_weights * keep
+            branch_weights = branch_weights / branch_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        b0 = self.branch_identity(feat)
+        b1 = self.branch_dw3(feat)
+        b2 = self.branch_dw5(feat)
+        b3 = self.branch_dw7(feat)
+        b4 = 0.5 * (self.branch_h1x5(feat) + self.branch_v5x1(feat))
+        b5 = 0.5 * (self.branch_h1x7(feat) + self.branch_v7x1(feat))
+
+        branches = torch.stack([b0, b1, b2, b3, b4, b5], dim=1)
+        out = (branches * branch_weights.view(feat.shape[0], self.num_branches, 1, 1, 1)).sum(dim=1)
+
+        size_emb = self.size_embed_for_channel(size_feat)
+        gate_input = torch.cat([center_feat, context_feat, size_emb], dim=1)
+        channel_gate = torch.sigmoid(self.channel_gate_mlp(gate_input)).view(feat.shape[0], self.out_ch, 1, 1)
+        out = out * (2.0 * channel_gate)
+        out = self.channel_mix(out)
+        out = self.refine(out)
+
+        return out, {
+            "branch_weights": branch_weights.detach(),
+            "channel_gate_mean": channel_gate.detach().mean(),
+            "channel_gate_std": channel_gate.detach().std(),
+            "template_context_feat": context_feat,
+        }
+
+
+class HighResolutionDecoder(nn.Module):
+    def __init__(self, in_ch=128, mid_ch=96, out_ch=64):
+        super().__init__()
+        self.pre = ConvGNAct(in_ch, in_ch, 3, 1, 1)
+        self.up1 = nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False), ConvGNAct(in_ch, mid_ch, 3, 1, 1))
+        self.up2 = nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False), ConvGNAct(mid_ch, out_ch, 3, 1, 1))
+    def forward(self, x):
+        return self.up2(self.up1(self.pre(x)))
+
+
+def sample_template_center_query(feat_hr, template_boxes_sam):
+    """
+    RoIAlign 版中心 query。
+    不聚合中心小区域，只取模板中心所在 token 对应的 1×1 RoIAlign 特征。
+    """
+    B, C, H, W = feat_hr.shape
+    device = feat_hr.device
+    dtype = feat_hr.dtype
+
+    rois = []
+    token_size = sam_img_size / float(pred_size)
+
+    for i, box in enumerate(template_boxes_sam):
+        x1, y1, x2, y2 = box
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+
+        qx1 = cx - token_size * 0.5
+        qy1 = cy - token_size * 0.5
+        qx2 = cx + token_size * 0.5
+        qy2 = cy + token_size * 0.5
+
+        qx1 = max(0.0, min(qx1, sam_img_size - 1.0))
+        qy1 = max(0.0, min(qy1, sam_img_size - 1.0))
+        qx2 = max(qx1 + 1.0, min(qx2, sam_img_size - 1.0))
+        qy2 = max(qy1 + 1.0, min(qy2, sam_img_size - 1.0))
+
+        rois.append([i, qx1, qy1, qx2, qy2])
+
+    rois = torch.tensor(rois, device=device, dtype=dtype)
+    spatial_scale = W / float(sam_img_size)
+
+    q_roi = roi_align(
+        input=feat_hr,
+        boxes=rois,
+        output_size=(1, 1),
+        spatial_scale=spatial_scale,
+        sampling_ratio=2,
+        aligned=True,
+    )
+
+    return q_roi[:, :, 0, 0]
+
+
+
+class TemplateContextAttentionGate(nn.Module):
+    """
+    模板上下文注意力抑制模块。
+
+    目标：
+        - 用模板整体 context_feat 生成上下文 query；
+        - 和全图 high-res local context 特征匹配，生成 attention logits/map；
+        - 用更宽的 Gaussian attention target 做辅助监督；
+        - 用 attention map 抑制“中心像但上下文不像”的假响应。
+    """
+    def __init__(self, template_dim=128, feat_dim=64):
+        super().__init__()
+
+        self.template_proj = nn.Sequential(
+            nn.Linear(template_dim, feat_dim),
+            nn.GELU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+
+        self.local_context = nn.Sequential(
+            ConvGNAct(feat_dim, feat_dim, 3, 1, 1),
+            ConvGNAct(feat_dim, feat_dim, 3, 1, 1),
+        )
+
+        # cosine ∈ [-1, 1]，scale 成更适合 focal 的 logit 范围
+        self.logit_scale = nn.Parameter(torch.tensor(5.0))
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, feat_hr, template_context_feat):
+        local_feat = self.local_context(feat_hr)  # [B,64,H,W]
+        q_context = self.template_proj(template_context_feat)  # [B,64]
+
+        local_norm = F.normalize(local_feat, dim=1)
+        q_norm = F.normalize(q_context, dim=1).view(q_context.shape[0], q_context.shape[1], 1, 1)
+
+        context_sim = (local_norm * q_norm).sum(dim=1, keepdim=True)
+        attn_logits = context_sim * self.logit_scale + self.logit_bias
+        attn_map = torch.sigmoid(attn_logits)
+        return attn_logits, attn_map, context_sim
+
+
+class PredictionHead(nn.Module):
+    def __init__(self, in_ch=65, hidden=64):
+        super().__init__()
+        self.stem = nn.Sequential(
+            ConvGNAct(in_ch, hidden, 3, 1, 1),
+            ConvGNAct(hidden, hidden, 3, 1, 1),
+        )
+        self.center_head = nn.Conv2d(hidden, 1, 1)
+        self.offset_cls_head = nn.Conv2d(hidden, 4, 1)
+        self.size_scale_head = nn.Conv2d(hidden, 2, 1)
+
+        nn.init.constant_(self.center_head.bias, -4.0)
+        nn.init.zeros_(self.size_scale_head.weight)
+        nn.init.zeros_(self.size_scale_head.bias)
+
+    def forward(self, x):
+        f = self.stem(x)
+        center_logits = self.center_head(f)
+        offset_cls_logits = self.offset_cls_head(f)
+        size_scale = torch.clamp(self.size_scale_head(f), min=-2.0, max=2.0)
+        return center_logits, offset_cls_logits, size_scale
+
+
+class TDCCDetector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Cached-feature version: 不再加载/运行 SAM encoder。
+        self.dynamic_context = TemplateDynamicContextAggregation(256, project_dim, template_roi_size, num_context_branches)
+        self.decoder = HighResolutionDecoder(project_dim, decoder_mid_dim, decoder_out_dim)
+        # No-attention compact head: F_hr(64) + sim_center(1).
+        self.head = PredictionHead(decoder_out_dim + 1, decoder_out_dim)
+
+    def load_cached_sam_features(self, samples, device):
+        feats = []
+        for s in samples:
+            feat = s["sam_feat"]
+            if not torch.is_tensor(feat):
+                feat = torch.as_tensor(feat)
+            if feat.dim() == 4 and feat.shape[0] == 1:
+                feat = feat[0]
+            if cached_feature_to_float32:
+                feat = feat.float()
+            feats.append(feat.to(device, non_blocking=True).contiguous())
+        return torch.stack(feats, dim=0)
+
+    def forward(self, samples):
+        device = next(self.parameters()).device
+        template_boxes = [s["template_box"] for s in samples]
+        sam_feat = self.load_cached_sam_features(samples, device)
+
+        ctx, info = self.dynamic_context(sam_feat, template_boxes)
+        feat_hr = self.decoder(ctx)
+
+        # 中心相似：哪里像模板中心
+        q = sample_template_center_query(feat_hr, template_boxes)
+        sim_center = (
+            F.normalize(feat_hr, dim=1)
+            * F.normalize(q, dim=1).view(q.shape[0], q.shape[1], 1, 1)
+        ).sum(dim=1, keepdim=True)
+
+        # Compact 64+1 head: high-resolution feature + center-similarity map.
+        head_in = torch.cat([feat_hr, sim_center], dim=1)
+        center_logits, offset_cls_logits, size_scale = self.head(head_in)
+
+        return {
+            "center_logits": center_logits,
+            "offset_cls_logits": offset_cls_logits,
+            "size_scale": size_scale,
+            "sim_map": sim_center,
+            "branch_weights": info["branch_weights"],
+            "channel_gate_mean": info.get("channel_gate_mean", None),
+            "channel_gate_std": info.get("channel_gate_std", None),
+        }
+
+def numpy_nms(boxes, scores, iou_thresh=0.45, max_dets=300):
+    """
+    纯 numpy NMS，避免 torchvision.ops.nms 在 Windows 下 native crash。
+    boxes: numpy [N,4], xyxy
+    scores: numpy [N]
+    """
+    if boxes is None or len(boxes) == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    boxes = boxes.astype(np.float32)
+    scores = scores.astype(np.float32)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    order = scores.argsort()[::-1]
+
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+
+        if len(keep) >= max_dets:
+            break
+
+        if order.size == 1:
+            break
+
+        rest = order[1:]
+
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+
+        inter_w = np.maximum(0.0, xx2 - xx1)
+        inter_h = np.maximum(0.0, yy2 - yy1)
+        inter = inter_w * inter_h
+
+        union = areas[i] + areas[rest] - inter + 1e-9
+        iou = inter / union
+
+        order = rest[iou <= iou_thresh]
+
+    return np.asarray(keep, dtype=np.int64)
+
+def get_offset_table(device=None, dtype=torch.float32):
+    table = torch.tensor([
+        [-0.25, -0.25],
+        [ 0.25, -0.25],
+        [-0.25,  0.25],
+        [ 0.25,  0.25],
+    ], dtype=dtype)
+    if device is not None:
+        table = table.to(device)
+    return table
+
+
+def template_wh_256_from_sample(sample):
+    stride = sam_img_size / float(pred_size)
+    x1, y1, x2, y2 = sample["template_box"]
+    tw = max(1.0, (x2 - x1) / stride)
+    th = max(1.0, (y2 - y1) / stride)
+    return tw, th
+
+
+def gaussian2d(radius, sigma=None):
+    if sigma is None:
+        sigma = radius / 3.0 if radius > 0 else 1.0
+    d = 2 * radius + 1
+    x = np.arange(0, d, 1, np.float32)
+    y = x[:, None]
+    return np.exp(-((x - radius) ** 2 + (y - radius) ** 2) / (2 * sigma ** 2 + 1e-12))
+
+
+def draw_gaussian(heatmap, cx, cy, radius):
+    H, W = heatmap.shape
+    radius = int(radius)
+    g = gaussian2d(radius)
+    x, y = int(cx), int(cy)
+    left, right = min(x, radius), min(W - x - 1, radius)
+    top, bottom = min(y, radius), min(H - y - 1, radius)
+    if left < 0 or right < 0 or top < 0 or bottom < 0:
+        return
+    patch = heatmap[y-top:y+bottom+1, x-left:x+right+1]
+    gp = g[radius-top:radius+bottom+1, radius-left:radius+right+1]
+    if patch.shape == gp.shape:
+        np.maximum(patch, gp, out=patch)
+
+
+def build_targets(samples, device):
+    B, H, W = len(samples), pred_size, pred_size
+    center_t = np.zeros((B, 1, H, W), dtype=np.float32)
+    attn_t = np.zeros((B, 1, H, W), dtype=np.float32)
+    offset_cls_t = np.full((B, H, W), -1, dtype=np.int64)
+    size_scale_t = np.zeros((B, 2, H, W), dtype=np.float32)
+    template_wh_t = np.zeros((B, 2, H, W), dtype=np.float32)
+    box_t = np.zeros((B, 4, H, W), dtype=np.float32)
+    pos_mask = np.zeros((B, 1, H, W), dtype=np.float32)
+    stride = sam_img_size / float(pred_size)
+    all_gt_boxes_256 = []
+
+    for b, s in enumerate(samples):
+        boxes_256 = []
+        tw, th = template_wh_256_from_sample(s)
+        for x1, y1, x2, y2 in s["gt_boxes"]:
+            x1h, y1h, x2h, y2h = x1 / stride, y1 / stride, x2 / stride, y2 / stride
+            x1h, y1h = max(0, min(x1h, W - 1)), max(0, min(y1h, H - 1))
+            x2h, y2h = max(0, min(x2h, W - 1)), max(0, min(y2h, H - 1))
+            if x2h <= x1h or y2h <= y1h:
+                continue
+            cx, cy = 0.5 * (x1h + x2h), 0.5 * (y1h + y2h)
+            ix, iy = int(round(cx)), int(round(cy))
+            if ix < 0 or ix >= W or iy < 0 or iy >= H:
+                continue
+            gw, gh = max(1e-3, x2h - x1h), max(1e-3, y2h - y1h)
+            radius = max(gaussian_min_radius, int(round(min(gw, gh) * gaussian_radius_ratio)))
+            attn_radius = max(gaussian_min_radius + 1, int(round(min(gw, gh) * attention_radius_ratio)))
+            draw_gaussian(center_t[b, 0], ix, iy, radius)
+            draw_gaussian(attn_t[b, 0], ix, iy, attn_radius)
+            dx = cx - ix
+            dy = cy - iy
+            if dx < 0 and dy < 0:
+                cls = 0
+            elif dx >= 0 and dy < 0:
+                cls = 1
+            elif dx < 0 and dy >= 0:
+                cls = 2
+            else:
+                cls = 3
+            pos_mask[b, 0, iy, ix] = 1.0
+            offset_cls_t[b, iy, ix] = cls
+            size_scale_t[b, :, iy, ix] = [
+                math.log(gw / max(tw, 1e-3)),
+                math.log(gh / max(th, 1e-3)),
+            ]
+            template_wh_t[b, :, iy, ix] = [tw, th]
+            box_t[b, :, iy, ix] = [x1h, y1h, x2h, y2h]
+            boxes_256.append([x1h, y1h, x2h, y2h])
+        all_gt_boxes_256.append(boxes_256)
+
+    return {
+        "center": torch.tensor(center_t, device=device),
+        "attn": torch.tensor(attn_t, device=device),
+        "offset_cls": torch.tensor(offset_cls_t, device=device),
+        "size_scale": torch.tensor(size_scale_t, device=device),
+        "template_wh": torch.tensor(template_wh_t, device=device),
+        "box": torch.tensor(box_t, device=device),
+        "pos_mask": torch.tensor(pos_mask, device=device),
+        "gt_boxes_256": all_gt_boxes_256,
+    }
+
+
+def center_focal_loss(logits, target):
+    pred = torch.sigmoid(logits).clamp(min=1e-4, max=1-1e-4)
+    pos = target.eq(1.0).float()
+    neg = target.lt(1.0).float()
+    neg_w = torch.pow(1 - target, 4)
+    pos_loss = -torch.log(pred) * torch.pow(1 - pred, 2) * pos
+    neg_loss = -torch.log(1 - pred) * torch.pow(pred, 2) * neg_w * neg
+    return (pos_loss.sum() + neg_loss.sum()) / pos.sum().clamp(min=1.0)
+
+
+def boxes_iou_xyxy(boxes1, boxes2):
+    x1 = torch.max(boxes1[:, 0], boxes2[:, 0]); y1 = torch.max(boxes1[:, 1], boxes2[:, 1])
+    x2 = torch.min(boxes1[:, 2], boxes2[:, 2]); y2 = torch.min(boxes1[:, 3], boxes2[:, 3])
+    inter = (x2-x1).clamp(min=0) * (y2-y1).clamp(min=0)
+    area1 = (boxes1[:,2]-boxes1[:,0]).clamp(min=0) * (boxes1[:,3]-boxes1[:,1]).clamp(min=0)
+    area2 = (boxes2[:,2]-boxes2[:,0]).clamp(min=0) * (boxes2[:,3]-boxes2[:,1]).clamp(min=0)
+    return inter / (area1 + area2 - inter + 1e-7)
+
+
+def giou_loss_xyxy(boxes1, boxes2):
+    iou = boxes_iou_xyxy(boxes1, boxes2)
+    cx1 = torch.min(boxes1[:,0], boxes2[:,0]); cy1 = torch.min(boxes1[:,1], boxes2[:,1])
+    cx2 = torch.max(boxes1[:,2], boxes2[:,2]); cy2 = torch.max(boxes1[:,3], boxes2[:,3])
+    c_area = (cx2-cx1).clamp(min=0) * (cy2-cy1).clamp(min=0) + 1e-7
+    area1 = (boxes1[:,2]-boxes1[:,0]).clamp(min=0) * (boxes1[:,3]-boxes1[:,1]).clamp(min=0)
+    area2 = (boxes2[:,2]-boxes2[:,0]).clamp(min=0) * (boxes2[:,3]-boxes2[:,1]).clamp(min=0)
+    x1 = torch.max(boxes1[:,0], boxes2[:,0]); y1 = torch.max(boxes1[:,1], boxes2[:,1])
+    x2 = torch.min(boxes1[:,2], boxes2[:,2]); y2 = torch.min(boxes1[:,3], boxes2[:,3])
+    inter = (x2-x1).clamp(min=0) * (y2-y1).clamp(min=0)
+    union = area1 + area2 - inter + 1e-7
+    giou = iou - (c_area - union) / c_area
+    return 1.0 - giou
+
+
+def gather_center_size_predictions(outputs, targets):
+    pos = torch.nonzero(targets["pos_mask"][:, 0] > 0.5, as_tuple=False)
+    if pos.numel() == 0:
+        return None
+    bs, ys, xs = pos[:, 0], pos[:, 1], pos[:, 2]
+    offset_logits = outputs["offset_cls_logits"][bs, :, ys, xs]
+    size_scale = outputs["size_scale"][bs, :, ys, xs]
+    offset_cls_t = targets["offset_cls"][bs, ys, xs]
+    size_scale_t = targets["size_scale"][bs, :, ys, xs]
+    template_wh = targets["template_wh"][bs, :, ys, xs]
+    true_boxes = targets["box"][bs, :, ys, xs]
+
+    offset_table = get_offset_table(device=offset_logits.device, dtype=offset_logits.dtype)
+    offset_prob = F.softmax(offset_logits, dim=1)
+    pred_offset = offset_prob @ offset_table
+    cx = xs.float() + pred_offset[:, 0]
+    cy = ys.float() + pred_offset[:, 1]
+    scale = torch.exp(torch.clamp(size_scale, min=-2.0, max=2.0))
+    pred_w = (template_wh[:, 0] * scale[:, 0]).clamp(min=1e-3, max=pred_size - 1)
+    pred_h = (template_wh[:, 1] * scale[:, 1]).clamp(min=1e-3, max=pred_size - 1)
+    pred_boxes = torch.stack([cx - 0.5 * pred_w, cy - 0.5 * pred_h, cx + 0.5 * pred_w, cy + 0.5 * pred_h], dim=1)
+    pred_boxes = torch.stack([pred_boxes[:, 0].clamp(0, pred_size - 1), pred_boxes[:, 1].clamp(0, pred_size - 1), pred_boxes[:, 2].clamp(0, pred_size - 1), pred_boxes[:, 3].clamp(0, pred_size - 1)], dim=1)
+    true_boxes = torch.stack([true_boxes[:, 0].clamp(0, pred_size - 1), true_boxes[:, 1].clamp(0, pred_size - 1), true_boxes[:, 2].clamp(0, pred_size - 1), true_boxes[:, 3].clamp(0, pred_size - 1)], dim=1)
+    return offset_logits, offset_cls_t, size_scale, size_scale_t, pred_boxes, true_boxes
+
+
+def compute_loss(outputs, targets):
+    center_loss = center_focal_loss(outputs["center_logits"], targets["center"])
+    if "attn_logits" in outputs and "attn" in targets:
+        attn_loss = center_focal_loss(outputs["attn_logits"], targets["attn"])
+    else:
+        attn_loss = outputs["center_logits"].new_tensor(0.0)
+    gathered = gather_center_size_predictions(outputs, targets)
+    if gathered is None:
+        offset_loss = outputs["center_logits"].new_tensor(0.0)
+        size_loss = outputs["center_logits"].new_tensor(0.0)
+        giou = outputs["center_logits"].new_tensor(0.0)
+        npos = 0.0
+    else:
+        offset_logits, offset_cls_t, size_scale, size_scale_t, pred_boxes, true_boxes = gathered
+        offset_loss = F.cross_entropy(offset_logits, offset_cls_t.long(), reduction="mean")
+        size_loss = F.smooth_l1_loss(size_scale, size_scale_t, reduction="mean")
+        giou = giou_loss_xyxy(pred_boxes, true_boxes).mean()
+        npos = float(pred_boxes.shape[0])
+    total = lambda_center * center_loss + lambda_attn * attn_loss + lambda_offset_cls * offset_loss + lambda_size * size_loss + lambda_giou * giou
+    return total, {
+        "total": float(total.detach().cpu()),
+        "center": float(center_loss.detach().cpu()),
+        "attn": float(attn_loss.detach().cpu()),
+        "offset": float(offset_loss.detach().cpu()),
+        "size": float(size_loss.detach().cpu()),
+        "giou": float(giou.detach().cpu()),
+        "pos": npos,
+    }
+
+
+def decode_predictions(outputs, samples, score_thr=0.25):
+    probs = torch.sigmoid(outputs["center_logits"])
+    offset_logits_all = outputs["offset_cls_logits"]
+    size_scale_all = outputs["size_scale"]
+    B, _, H, W = probs.shape
+    pooled = F.max_pool2d(probs, 3, 1, 1)
+    peak = (probs == pooled)
+    offset_table = get_offset_table(device=probs.device, dtype=probs.dtype)
+    results = []
+    for b in range(B):
+        score_map = probs[b, 0]
+        mask = peak[b, 0] & (score_map >= score_thr)
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+        if ys.numel() == 0:
+            results.append({"boxes": np.zeros((0, 4), np.float32), "scores": np.zeros((0,), np.float32)})
+            continue
+        scores = score_map[ys, xs]
+        if scores.numel() > topk_per_image:
+            scores, idx = torch.topk(scores, topk_per_image)
+            ys, xs = ys[idx], xs[idx]
+        offset_logits = offset_logits_all[b, :, ys, xs].permute(1, 0)
+        offset_cls = torch.argmax(offset_logits, dim=1)
+        pred_offset = offset_table[offset_cls]
+        cx = xs.float() + pred_offset[:, 0]
+        cy = ys.float() + pred_offset[:, 1]
+        size_scale = size_scale_all[b, :, ys, xs].permute(1, 0)
+        size_scale = torch.clamp(size_scale, min=-2.0, max=2.0)
+        tw, th = template_wh_256_from_sample(samples[b])
+        template_wh = torch.tensor([tw, th], device=probs.device, dtype=probs.dtype).view(1, 2)
+        pred_wh = template_wh * torch.exp(size_scale)
+        pred_w = pred_wh[:, 0].clamp(min=1e-3, max=W - 1)
+        pred_h = pred_wh[:, 1].clamp(min=1e-3, max=H - 1)
+        boxes_256 = torch.stack([cx - 0.5 * pred_w, cy - 0.5 * pred_h, cx + 0.5 * pred_w, cy + 0.5 * pred_h], dim=1)
+        boxes_256 = torch.stack([boxes_256[:, 0].clamp(0, W - 1), boxes_256[:, 1].clamp(0, H - 1), boxes_256[:, 2].clamp(0, W - 1), boxes_256[:, 3].clamp(0, H - 1)], dim=1)
+        boxes_sam = boxes_256 * (sam_img_size / float(pred_size))
+        boxes_np = boxes_sam.detach().cpu().numpy().astype(np.float32)
+        scores_np = scores.detach().cpu().numpy().astype(np.float32)
+        if boxes_np.shape[0] > 0:
+            keep = numpy_nms(boxes_np, scores_np, iou_thresh=nms_iou_thresh, max_dets=max_dets_per_image)
+            boxes_np = boxes_np[keep]
+            scores_np = scores_np[keep]
+        boxes_orig = boxes_sam_padded_to_original(boxes_np.tolist(), samples[b]["meta"])
+        results.append({"boxes": np.asarray(boxes_orig, np.float32), "scores": scores_np.astype(np.float32)})
+    return results
+
+
+def iou_np(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+    aa = max(0, ax2-ax1) * max(0, ay2-ay1)
+    ab = max(0, bx2-bx1) * max(0, by2-by1)
+    return inter / (aa + ab - inter + 1e-9)
+
+
+def make_map_metric():
+    return MeanAveragePrecision(
+        box_format="xyxy",
+        iou_type="bbox",
+        max_detection_thresholds=[1, 10, int(ap_max_dets_per_image)],
+        class_metrics=False,
+        backend="faster_coco_eval",
+    )
+
+
+def safe_float_metric(x):
+    if torch.is_tensor(x):
+        return float(x.detach().cpu())
+    return float(x)
+
+
+def tensors_for_map_from_preds(preds, samples):
+    pred_list = []
+    target_list = []
+    for s, p in zip(samples, preds):
+        pred_boxes_np = p["boxes"].astype(np.float32)
+        pred_scores_np = p["scores"].astype(np.float32)
+        if pred_boxes_np.shape[0] == 0:
+            pred_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            pred_scores = torch.zeros((0,), dtype=torch.float32)
+            pred_labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            pred_boxes = torch.as_tensor(pred_boxes_np, dtype=torch.float32)
+            pred_scores = torch.as_tensor(pred_scores_np, dtype=torch.float32)
+            pred_labels = torch.ones((pred_boxes.shape[0],), dtype=torch.long)
+        gt_boxes_np = np.asarray(boxes_sam_padded_to_original(s["gt_boxes"], s["meta"]), dtype=np.float32)
+        if gt_boxes_np.shape[0] == 0:
+            target_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            target_labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            target_boxes = torch.as_tensor(gt_boxes_np, dtype=torch.float32)
+            target_labels = torch.ones((target_boxes.shape[0],), dtype=torch.long)
+        pred_list.append({"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels})
+        target_list.append({"boxes": target_boxes, "labels": target_labels})
+    return pred_list, target_list
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, score_thr=None, trace_path=None, epoch=None):
+    model.eval()
+    if score_thr is None:
+        score_thr = ap_score_thresh
+    metric = make_map_metric()
+    total_gt = 0
+    total_pred = 0
+
+    def trace(msg):
+        if trace_path is not None:
+            with open(trace_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\\n")
+        print(msg, flush=True)
+
+    trace(f"epoch {epoch}: eval_start score_thr={score_thr}")
+    for eval_i, samples in enumerate(loader, start=1):
+        image_ids = [s["image_id"] for s in samples]
+        if eval_i == 1 or eval_i % eval_trace_every == 0:
+            trace(f"epoch {epoch}: eval_iter {eval_i}/{len(loader)} batch_size={len(samples)} image_ids={image_ids[:3]} before_forward")
+        with amp_autocast(device):
+            out = model(samples)
+        if eval_i == 1 or eval_i % eval_trace_every == 0:
+            trace(f"epoch {epoch}: eval_iter {eval_i}/{len(loader)} after_forward")
+        preds = decode_predictions(out, samples, score_thr)
+        if eval_i == 1 or eval_i % eval_trace_every == 0:
+            trace(f"epoch {epoch}: eval_iter {eval_i}/{len(loader)} after_decode")
+        pred_list, target_list = tensors_for_map_from_preds(preds, samples)
+        metric.update(pred_list, target_list)
+        for s, p in zip(samples, preds):
+            total_gt += len(s["gt_boxes"])
+            total_pred += len(p["boxes"])
+        del out, preds, pred_list, target_list
+        if torch.cuda.is_available() and eval_i % eval_empty_cache_every == 0:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        if eval_i == 1 or eval_i % eval_trace_every == 0:
+            trace(f"epoch {epoch}: eval_iter {eval_i}/{len(loader)} after_metric_update total_gt={total_gt} total_pred={total_pred}")
+    trace(f"epoch {epoch}: eval_loop_done total_gt={total_gt} total_pred={total_pred}")
+    trace(f"epoch {epoch}: before_metric_compute")
+    result = metric.compute()
+    ap = safe_float_metric(result.get("map", torch.tensor(0.0)))
+    ap50 = safe_float_metric(result.get("map_50", torch.tensor(0.0)))
+    ap75 = safe_float_metric(result.get("map_75", torch.tensor(0.0)))
+    ap = 0.0 if ap < 0 else ap
+    ap50 = 0.0 if ap50 < 0 else ap50
+    ap75 = 0.0 if ap75 < 0 else ap75
+    trace(f"epoch {epoch}: eval_done AP={ap:.6f} AP50={ap50:.6f} AP75={ap75:.6f}")
+    return {"AP": ap, "AP50": ap50, "AP75": ap75, "GT": total_gt, "Pred": total_pred, "NumPredForAP": total_pred, "score_thr_for_ap": score_thr}
+
+
+def draw_vis(samples, preds, out_dir, max_images=20):
+    ensure_dir(out_dir)
+
+    for i, (s, p) in enumerate(zip(samples, preds)):
+        if i >= max_images:
+            break
+        img_for_vis = s.get("image", None)
+        if img_for_vis is None:
+            img_for_vis = np.zeros((sam_img_size, sam_img_size, 3), dtype=np.uint8)
+        pil = Image.fromarray(img_for_vis.copy()).convert("RGB")
+        draw = ImageDraw.Draw(pil)
+        for j, gb in enumerate(s["gt_boxes"]):
+            x1,y1,x2,y2 = gb; draw.rectangle([x1,y1,x2,y2], outline=(0,255,0), width=2)
+            if j < 30: draw.text((x1, max(0,y1-12)), f"G{j}", fill=(0,255,0))
+        x1,y1,x2,y2 = s["template_box"]; draw.rectangle([x1,y1,x2,y2], outline=(0,128,255), width=4); draw.text((x1,max(0,y1-16)), "TEMPLATE", fill=(0,128,255))
+        scale = s["meta"]["scale"]
+        for j, (box, sc) in enumerate(zip(p["boxes"], p["scores"])):
+            px1,py1,px2,py2 = box
+            sb = [px1*scale, py1*scale, px2*scale, py2*scale]
+            draw.rectangle(sb, outline=(255,0,0), width=2)
+            if j < 50: draw.text((sb[0], max(0,sb[1]-12)), f"{sc:.2f}", fill=(255,0,0))
+        pil.save(os.path.join(out_dir, f"{i:03d}_{s['image_id']}.jpg"), quality=95)
+
+
+
+def gpu_mem(prefix=""):
+    """
+    打印 CUDA 显存状态，用于定位 epoch 末尾 native crash 前的显存状态。
+    """
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserv = torch.cuda.memory_reserved() / 1024**3
+    peak = torch.cuda.max_memory_reserved() / 1024**3
+    print(f"[GPU] {prefix} allocated={alloc:.2f}GB reserved={reserv:.2f}GB peak_reserved={peak:.2f}GB", flush=True)
+
+
+def get_trainable_state_dict(model):
+    """
+    只保存可训练模块，不保存冻结 SAM。
+    这样 checkpoint 小很多，也能显著降低 torch.save 在 epoch 末尾触发 native crash 的概率。
+    加载时 strict=False。
+    """
+    state = model.state_dict()
+    return {k: v.detach().cpu() for k, v in state.items() if not k.startswith("sam.")}
+
+
+
+def append_jsonl(path, record):
+    """
+    训练日志 JSONL，出问题时至少能知道最后完成到哪一步。
+    """
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\\n")
+
+
+
+
+
+def resolve_resume_path():
+    """
+    返回断点续训 checkpoint 路径。
+    resume_checkpoint_path 留空时，默认读取 save_dir/last_model.pth。
+    """
+    if resume_checkpoint_path is not None and str(resume_checkpoint_path).strip():
+        return resume_checkpoint_path
+    return os.path.join(save_dir, "last_model.pth")
+
+
+def try_resume_training(model, optimizer, device):
+    """
+    如果 last_model.pth 存在，则恢复 model / optimizer，并返回 start_epoch。
+    返回：
+        start_epoch: 下一轮要开始训练的 epoch
+        resumed: 是否成功恢复
+        checkpoint_path: 实际读取的 checkpoint 路径
+    """
+    if not auto_resume:
+        print("[Resume] auto_resume=False, start from epoch 1.", flush=True)
+        return 1, False, None
+
+    checkpoint_path = resolve_resume_path()
+
+    if not os.path.isfile(checkpoint_path):
+        print(f"[Resume] checkpoint not found: {checkpoint_path}", flush=True)
+        print("[Resume] start from epoch 1.", flush=True)
+        return 1, False, checkpoint_path
+
+    print(f"[Resume] loading checkpoint: {checkpoint_path}", flush=True)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    print(f"[Resume] model loaded. missing={len(missing)}, unexpected={len(unexpected)}", flush=True)
+    if len(missing) > 0:
+        print("[Resume] missing examples:", missing[:10], flush=True)
+    if len(unexpected) > 0:
+        print("[Resume] unexpected examples:", unexpected[:10], flush=True)
+
+    if isinstance(ckpt, dict) and "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print("[Resume] optimizer loaded.", flush=True)
+        except Exception as e:
+            print(f"[Resume] optimizer load failed, continue with fresh optimizer. reason: {repr(e)}", flush=True)
+    else:
+        print("[Resume] no optimizer state in checkpoint, continue with fresh optimizer.", flush=True)
+
+    last_epoch = int(ckpt.get("epoch", 0)) if isinstance(ckpt, dict) else 0
+    start_epoch = last_epoch + 1
+
+    if start_epoch > epochs:
+        print(f"[Resume] checkpoint epoch={last_epoch}, configured epochs={epochs}. Nothing to train unless you increase epochs.", flush=True)
+    else:
+        print(f"[Resume] last_epoch={last_epoch}, continue from epoch {start_epoch}.", flush=True)
+
+    return start_epoch, True, checkpoint_path
+
+
+def train():
+    set_seed(seed)
+    if debug_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        try:
+            torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+        except Exception:
+            pass
+    ensure_dir(save_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("="*80)
+    print(f"TDCC-SAM RPINE cached ablation: {ablation_name}")
+    print("Device:", device)
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("GPU count visible:", torch.cuda.device_count())
+    print("save_dir:", save_dir)
+    print("="*80)
+
+    train_set = TemplateDataset(train_image_dir, train_exemplar_json_path, train_label_dir, training=True, split_name="train")
+    val_set = TemplateDataset(val_image_dir, val_exemplar_json_path, val_label_dir, training=False, split_name="test")
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn, pin_memory=torch.cuda.is_available(), drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=eval_batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn, pin_memory=torch.cuda.is_available(), drop_last=False)
+
+    model = TDCCDetector().to(device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    print("Trainable params:", sum(p.numel() for p in params))
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    scaler = make_grad_scaler(device)
+
+    start_epoch, resumed, resumed_from = try_resume_training(model, opt, device)
+
+    config = {k: v for k, v in globals().items() if k in ["ablation_name","train_image_dir","train_exemplar_json_path","train_label_dir","val_image_dir","val_exemplar_json_path","val_label_dir","sam_checkpoint","sam_model_type","sam_feature_cache_root","cached_feature_to_float32","strict_feature_cache","sam_img_size","pred_size","project_dim","batch_size","eval_batch_size","lr","weight_decay","lambda_attn","lambda_offset_cls","lambda_size","lambda_giou","attention_radius_ratio","ap_score_thresh","ap_max_dets_per_image","nms_iou_thresh","auto_resume","resume_checkpoint_path","use_amp","amp_dtype","allow_tf32","skip_cached_image_resize","template_jitter_center","template_jitter_scale","feature_dropout_p","branch_dropout_p"]}
+    with open(os.path.join(save_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    log_jsonl_path = os.path.join(save_dir, "train_log.jsonl")
+    epoch_csv_path = os.path.join(save_dir, "epoch_metrics.csv")
+    stage_log_path = os.path.join(save_dir, "stage_log.txt")
+
+    # 断点续训时不要覆盖旧日志；从头训练时重新写日志头。
+    if resumed:
+        with open(stage_log_path, "a", encoding="utf-8") as f:
+            f.write(f"\nresume from {resumed_from}, start_epoch={start_epoch}\n")
+        if not os.path.isfile(epoch_csv_path):
+            with open(epoch_csv_path, "w", encoding="utf-8") as f:
+                f.write("epoch,train_loss,center,attn,offset,size,giou,pos,AP,AP50,AP75,GT,Pred,NumPredForAP,score_thr_for_ap,time_sec\n")
+    else:
+        with open(stage_log_path, "w", encoding="utf-8") as f:
+            f.write("stage log\n")
+        with open(epoch_csv_path, "w", encoding="utf-8") as f:
+            f.write("epoch,train_loss,center,attn,offset,size,giou,pos,AP,AP50,AP75,GT,Pred,NumPredForAP,score_thr_for_ap,time_sec\n")
+
+    best_ap = best_ap50 = best_ap75 = -1.0
+
+    # 断点续训时读取已有 best checkpoint 的指标，避免后续保存逻辑从 -1 重新开始。
+    for best_name, attr_name in [
+        ("best_ap_model.pth", "AP"),
+        ("best_ap50_model.pth", "AP50"),
+        ("best_ap75_model.pth", "AP75"),
+    ]:
+        best_path = os.path.join(save_dir, best_name)
+        if os.path.isfile(best_path):
+            try:
+                best_ckpt = torch.load(best_path, map_location="cpu")
+                best_metrics = best_ckpt.get("metrics", {})
+                val = float(best_metrics.get(attr_name, -1.0))
+                if attr_name == "AP":
+                    best_ap = val
+                elif attr_name == "AP50":
+                    best_ap50 = val
+                elif attr_name == "AP75":
+                    best_ap75 = val
+                print(f"[Resume] existing {best_name}: {attr_name}={val:.4f}", flush=True)
+            except Exception as e:
+                print(f"[Resume] failed to read {best_path}: {repr(e)}", flush=True)
+
+    for epoch in range(start_epoch, epochs + 1):
+        print(f"\n[Start Epoch {epoch:03d}]", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        model.train()
+        t0 = time.time()
+        running = defaultdict(float); steps = 0
+        gpu_mem(f"epoch {epoch:03d} start")
+        for it, samples in enumerate(train_loader, start=1):
+            opt.zero_grad(set_to_none=True)
+            with amp_autocast(device):
+                out = model(samples)
+                targets = build_targets(samples, device)
+                loss, info = compute_loss(out, targets)
+
+            scaler.scale(loss).backward()
+            if grad_clip_norm:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(params, grad_clip_norm)
+            scaler.step(opt)
+            scaler.update()
+            steps += 1
+            for k, v in info.items(): running[k] += v
+            if it % 100 == 0:
+                bw = out["branch_weights"].detach().mean(dim=0).cpu().numpy()
+                cg_mean = out.get("channel_gate_mean", None)
+                cg_std = out.get("channel_gate_std", None)
+                if cg_mean is not None and cg_std is not None:
+                    cg_text = f" cg_mean={float(cg_mean.detach().cpu()):.3f} cg_std={float(cg_std.detach().cpu()):.3f}"
+                else:
+                    cg_text = ""
+                print(f"[Epoch {epoch:03d} | Iter {it:04d}/{len(train_loader):04d}] loss={running['total']/steps:.5f} center={running['center']/steps:.5f} attn={running['attn']/steps:.5f} offset={running['offset']/steps:.5f} size={running['size']/steps:.5f} giou={running['giou']/steps:.5f} pos={running['pos']/steps:.1f} branch={np.round(bw,3)}{cg_text}", flush=True)
+
+        # 清理最后一个 iteration 的输出引用，避免带着训练图进入评估/保存阶段。
+        try:
+            del out, targets, loss
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        with open(stage_log_path, "a", encoding="utf-8") as f:
+            f.write(f"epoch {epoch:03d}: before_last_save\n")
+        print(f"[Epoch {epoch:03d}] before normal last save", flush=True)
+        gpu_mem(f"epoch {epoch:03d} before last save")
+
+        torch.save({
+            "epoch": epoch,
+            "model": get_trainable_state_dict(model),
+            "optimizer": opt.state_dict(),
+            "config": config,
+        }, os.path.join(save_dir, "last_model.pth"))
+
+        with open(stage_log_path, "a", encoding="utf-8") as f:
+            f.write(f"epoch {epoch:03d}: after_last_save\n")
+        print(f"[Epoch {epoch:03d}] after normal last save", flush=True)
+        gpu_mem(f"epoch {epoch:03d} after last save")
+        if epoch % eval_interval == 0:
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: before_eval\n")
+            print(f"[Epoch {epoch:03d}] before eval", flush=True)
+            gpu_mem(f"epoch {epoch:03d} before eval")
+
+            metrics = evaluate(model, val_loader, device, score_thr=ap_score_thresh, trace_path=stage_log_path, epoch=epoch)
+
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: after_eval\n")
+            print(f"[Epoch {epoch:03d}] after eval", flush=True)
+            gpu_mem(f"epoch {epoch:03d} after eval")
+
+            print(
+                f"[Epoch {epoch:03d}] "
+                f"train_loss={running['total']/max(steps,1):.5f} "
+                f"center={running['center']/max(steps,1):.5f} "
+                f"attn={running['attn']/max(steps,1):.5f} "
+                f"offset={running['offset']/max(steps,1):.5f} "
+                f"size={running['size']/max(steps,1):.5f} "
+                f"giou={running['giou']/max(steps,1):.5f} "
+                f"pos={running['pos']/max(steps,1):.1f} | "
+                f"AP={metrics['AP']:.4f} "
+                f"AP50={metrics['AP50']:.4f} "
+                f"AP75={metrics['AP75']:.4f} | "
+                f"GT={metrics['GT']} Pred={metrics['Pred']} "
+                f"score_thr_for_ap={metrics['score_thr_for_ap']} "
+                f"time={time.time()-t0:.1f}s"
+            )
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": running['total']/max(steps,1),
+                "center": running['center']/max(steps,1),
+                "attn": running['attn']/max(steps,1),
+                "giou": running['giou']/max(steps,1),
+                "offset": running['offset']/max(steps,1),
+                "size": running['size']/max(steps,1),
+                "pos": running['pos']/max(steps,1),
+                **metrics,
+                "time_sec": time.time()-t0,
+            }
+            append_jsonl(log_jsonl_path, epoch_record)
+
+            with open(epoch_csv_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{epoch_record['epoch']},"
+                    f"{epoch_record['train_loss']:.6f},"
+                    f"{epoch_record['center']:.6f},"
+                    f"{epoch_record['attn']:.6f},"
+                    f"{epoch_record['offset']:.6f},"
+                    f"{epoch_record['size']:.6f},"
+                    f"{epoch_record['giou']:.6f},"
+                    f"{epoch_record['pos']:.3f},"
+                    f"{epoch_record['AP']:.6f},"
+                    f"{epoch_record['AP50']:.6f},"
+                    f"{epoch_record['AP75']:.6f},"
+                    f"{epoch_record['GT']},"
+                    f"{epoch_record['Pred']},"
+                    f"{epoch_record['NumPredForAP']},"
+                    f"{epoch_record['score_thr_for_ap']},"
+                    f"{epoch_record['time_sec']:.3f}\n"
+                )
+
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: before_best_saves\n")
+            print(f"[Epoch {epoch:03d}] before best saves", flush=True)
+
+            if metrics["AP50"] > best_ap50:
+                best_ap50 = metrics["AP50"]
+                torch.save({"epoch": epoch, "model": get_trainable_state_dict(model), "optimizer": opt.state_dict(), "config": config, "metrics": metrics}, os.path.join(save_dir, "best_ap50_model.pth"))
+                print(f"[Save Best AP50] {best_ap50:.4f}", flush=True)
+            if metrics["AP"] > best_ap:
+                best_ap = metrics["AP"]
+                torch.save({"epoch": epoch, "model": get_trainable_state_dict(model), "optimizer": opt.state_dict(), "config": config, "metrics": metrics}, os.path.join(save_dir, "best_ap_model.pth"))
+                print(f"[Save Best AP] {best_ap:.4f}", flush=True)
+            if metrics["AP75"] > best_ap75:
+                best_ap75 = metrics["AP75"]
+                torch.save({"epoch": epoch, "model": get_trainable_state_dict(model), "optimizer": opt.state_dict(), "config": config, "metrics": metrics}, os.path.join(save_dir, "best_ap75_model.pth"))
+                print(f"[Save Best AP75] {best_ap75:.4f}", flush=True)
+
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: after_best_saves\n")
+            print(f"[Epoch {epoch:03d}] after best saves", flush=True)
+            gpu_mem(f"epoch {epoch:03d} after best saves")
+        if epoch % vis_interval == 0:
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: before_visual\n")
+            print(f"[Epoch {epoch:03d}] before visual", flush=True)
+            gpu_mem(f"epoch {epoch:03d} before visual")
+
+            model.eval()
+            vis_samples = [val_set[i] for i in range(min(num_vis_images, len(val_set)))]
+            preds = []
+            with torch.no_grad():
+                for vs in vis_samples:
+                    out_vis = model([vs])
+                    pred_vis = decode_predictions(out_vis, [vs], score_thresh)
+                    preds.extend(pred_vis)
+                    del out_vis, pred_vis
+            out_dir = os.path.join(save_dir, "visuals", f"epoch_{epoch:03d}")
+            draw_vis(vis_samples, preds, out_dir, num_vis_images)
+            print("[Visual saved]", out_dir, flush=True)
+
+            with open(stage_log_path, "a", encoding="utf-8") as f:
+                f.write(f"epoch {epoch:03d}: after_visual\n")
+            gpu_mem(f"epoch {epoch:03d} after visual")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        with open(stage_log_path, "a", encoding="utf-8") as f:
+            f.write(f"epoch {epoch:03d}: end_epoch\n")
+        print(f"[End Epoch {epoch:03d}] time={time.time()-t0:.1f}s", flush=True)
+
+
+if __name__ == "__main__":
+    train()

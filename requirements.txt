@@ -1,0 +1,8 @@
+numpy
+pillow
+torch
+torchvision
+torchmetrics
+pycocotools
+tqdm
+segment-anything
